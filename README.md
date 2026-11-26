@@ -1,6 +1,10 @@
-# minitel-unoq
+<p align="center">
+  <img src="docs/logo.png" alt="minitel-unoq" width="300">
+</p>
 
-**Un vrai Minitel de 1985 connecté à MiniPavi, sans ligne téléphonique, grâce à un Arduino UNO Q.**
+<h1 align="center">minitel-unoq</h1>
+
+<p align="center"><b>Un vrai Minitel de 1985 connecté à MiniPavi, sans ligne téléphonique, grâce à un Arduino UNO Q.</b></p>
 
 L'UNO Q se branche sur la prise DIN « péri-informatique » du Minitel et sert de passerelle Wi-Fi vers [MiniPavi](https://www.minipavi.fr/) (`go.minipavi.fr:516`). Le Minitel croit parler au réseau Télétel ; en réalité c'est un petit Linux qui fait tout le travail. La matrice LED de la carte affiche l'état de la connexion.
 
