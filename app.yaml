@@ -1,0 +1,4 @@
+name: Minitel MiniPavi
+description: Passerelle Minitel 1 (prise DIN) <-> MiniPavi via le Wi-Fi de l'UNO Q, etat sur la matrice LED
+icon: 📟
+bricks: []
