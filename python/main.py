@@ -10,6 +10,7 @@ import time
 from arduino.app_utils import App, Bridge
 
 HOST, PORT = "go.minipavi.fr", 516
+OCTETS_PAR_S = 118              # 1200 bauds 7E1 = 120 octets/s
 
 # Etats affiches sur la matrice
 BOOT, READY, CONNECTING, ONLINE, ERROR = range(5)
@@ -41,15 +42,18 @@ def matrix(state):
 def to_minitel(data: bytes):
     """Envoie au Minitel en respectant son debit."""
     with tx_lock:                     # un seul emetteur a la fois
-        for i in range(0, len(data), 32):
-            chunk = data[i:i + 32]
-            for attempt in range(3):
-                try:
-                    Bridge.call("minitel_write", chunk.hex(), timeout=30)
-                    break
-                except Exception as e:
-                    log("envoi minitel (essai %d):" % (attempt + 1), e)
-                    time.sleep(0.5)
+        i = 0
+        while i < len(data):
+            chunk = data[i:i + 64]
+            try:
+                n = int(Bridge.call("minitel_write", chunk.hex(), timeout=10) or 0)
+            except Exception as e:
+                log("envoi minitel :", e)
+                time.sleep(1)
+                n = 0
+            i += n
+            # La file du MCU se vide a ~120 octets/s : on suit ce rythme.
+            time.sleep(max(n, 8) / OCTETS_PAR_S)
 
 
 # ---- Ecran Videotex ----------------------------------------------------

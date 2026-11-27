@@ -72,16 +72,20 @@ La matrice LED en façade :
 Minitel ──DIN 1200 bauds 7E1──► STM32 (sketch) ──Bridge RPC──► Linux (Python) ──Wi-Fi/TCP──► go.minipavi.fr:516
 ```
 
-- **`sketch/sketch.ino`** (microcontrôleur STM32U585) : un tuyau transparent entre le Minitel et Linux, plus la matrice LED.
+- **`sketch/sketch.ino`** (microcontrôleur STM32U585) : un tuyau transparent entre le Minitel et Linux sur l'USART1 réglée à 1200 bauds, plus la matrice LED.
 - **`python/main.py`** (Linux) : l'écran d'accueil, la touche Connexion/Fin et la connexion TCP à MiniPavi.
 
 ### Les pièges rencontrés (et contournés)
 
-**1. L'UART matérielle de D0/D1 ne descend pas à 1200 bauds.** Sur l'UNO Q, D0/D1 (PB7/PB6) correspondent à l'USART1, qui est aussi la console Zephyr à 115200 bauds. `Serial1.begin(1200)` n'a aucun effet visible : la carte continue d'émettre beaucoup trop vite et le Minitel n'affiche que des `?` et quelques lettres au hasard. Le sketch implémente donc une **UART logicielle** :
-- émission : chaque bit est posé sur D1 à une échéance absolue en `micros()` (833 µs par bit), ce qui évite toute dérive ;
-- réception : une interruption horodate chaque front de D0, puis `loop()` reconstruit les trames à partir des horodatages. Rien n'est perdu même quand la boucle est occupée à émettre.
+**1. `Serial1.begin(1200)` n'a aucun effet.** Sur l'UNO Q, D0/D1 (PB7/PB6) correspondent à l'USART1, cadencée à 160 MHz. Pour 1200 bauds, le diviseur vaudrait 160 000 000 / 1200 = 133 333, or le registre `BRR` ne fait que 16 bits (65 535 max) : le pilote Zephyr refuse la configuration et l'USART reste à sa vitesse précédente (la console, 115 200 bauds). Symptôme : le Minitel n'affiche que des `?` en vidéo inversée et quelques lettres au hasard.
 
-**2. Le 7E1 géré à la main.** La trame 7 bits + parité paire + 1 stop est construite par le code (bit de parité calculé sur le bit 7), indépendamment du support du cœur Arduino Zephyr.
+La solution : le STM32U5 a un **prédiviseur** (`USART_PRESC`) que le pilote n'utilise pas. Le sketch ouvre `Serial1` à 9600 bauds (que le pilote sait régler), puis arrête l'USART, écrit `PRESC = ÷8` et `BRR = 160 MHz / 8 / 1200 = 16 667`, et la relance : 1199,98 bauds. La fonction `minitel_diag` (Bridge) renvoie les registres pour vérifier.
+
+> Une première version utilisait une **UART logicielle** (bits posés à la main en `micros()`, réception par interruption sur front). Elle fonctionne quand la carte ne fait rien d'autre, mais dès qu'un autre code charge les interruptions (par exemple la matrice LED en 256 niveaux de gris), les bits se décalent et des caractères parasites apparaissent. L'UART matérielle est insensible à tout ça.
+
+**2. Le 7E1 géré à la main.** La trame matérielle est en 8N1 ; le code met la parité paire dans le bit 7 de chaque octet émis et la retire à la réception. Même trame de 10 bits que le 7E1 du Minitel, sans dépendre du support des formats 7 bits du cœur Arduino Zephyr.
+
+**2 bis. Ne jamais bloquer la boucle.** Le Python dépose les octets dans une file du microcontrôleur (`minitel_write` renvoie combien ont été acceptés) ; `loop()` les donne à `Serial1` au rythme de 1200 bauds, par rafales de 8 au plus, pour que `write()` ne bloque jamais.
 
 **3. Connexion/Fin n'a pas le même code partout.** Le Minitel 1 de 1985 envoie `SEP 0x59` au lieu du `SEP 0x49` des modèles plus récents. La passerelle accepte les deux et traduit `0x59` en `0x49` vers le serveur.
 
@@ -94,7 +98,7 @@ Minitel ──DIN 1200 bauds 7E1──► STM32 (sketch) ──Bridge RPC──�
 | Symptôme | Cause probable | Action |
 |---|---|---|
 | Écran vide, matrice sur **M** | broches 1 et 3 inversées | échanger les deux fils des extrémités |
-| `?` en vidéo inversée et lettres au hasard | mauvaise vitesse | vérifier que c'est bien ce sketch (UART logicielle) qui tourne |
+| `?` en vidéo inversée et lettres au hasard | mauvaise vitesse | vérifier les registres : `Bridge.call("minitel_diag")` doit donner `PRESC=4` et un BRR d'environ 16 667 |
 | Accueil affiché, Connexion/Fin sans effet | retour Minitel → carte absent | vérifier le pull-up 10 kΩ et le fil de la broche 3 ; lire les logs |
 | Caractères parasites au démarrage de la carte | journal de boot Zephyr sur D1 | normal, l'écran d'accueil les efface |
 | Matrice sur **X** | MiniPavi injoignable | vérifier le Wi-Fi de la carte |

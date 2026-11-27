@@ -1,38 +1,63 @@
 // =====================================================================
-//  UNO Q - cote microcontroleur (STM32) : tuyau transparent Minitel <-> Linux
+//  UNO Q - cote microcontroleur (STM32U585) : tuyau Minitel <-> Linux
 //  + matrice LED en facade pour l'etat de la passerelle.
 //
-//  Cablage prise DIN du Minitel :
-//    DIN 1 (RX Minitel)  <-- 1k -- D1
+//  Cablage prise DIN du Minitel (D0 = PB7 / D1 = PB6 = USART1 = Serial1) :
+//    DIN 1 (RX Minitel)  <-- 1k -- D1 (TX)
 //    DIN 2 (masse)       --------- GND
-//    DIN 3 (TX Minitel)  --> 1k -- D0 + pull-up 10k vers 3V3
+//    DIN 3 (TX Minitel)  --> 1k -- D0 (RX) + pull-up 10k vers 3V3
 //
-//  D0/D1 sont l'USART1 = console Zephyr a 115200, que le pilote ne sait pas
-//  descendre a 1200 bauds. On fait donc une UART LOGICIELLE 1200 bauds 7E1 :
-//   - emission : bits generes sur D1 avec des echeances absolues en micros()
-//   - reception : interruption sur chaque front de D0 (horodatage), puis
-//     decodage des trames dans loop() a partir des horodatages.
+//  1200 bauds sur l'USART1 : le pilote Zephyr ne sait pas y descendre (a 160 MHz, le
+//  diviseur BRR de 16 bits deborde), et Serial1.begin(1200) reste alors sans effet.
+//  On ouvre donc Serial1 a 9600 bauds, puis on regle nous-memes le prediviseur PRESC
+//  du STM32U5 (/8) et BRR pour 1200 bauds. Le materiel cadence les bits : aucune
+//  interruption (matrice LED, Bridge...) ne peut les decaler.
+//  Le Minitel parle en 7E1 : trame materielle 8N1, parite paire calculee par le code (bit 7).
 // =====================================================================
-#include <Arduino_LED_Matrix.h>
 #include <Arduino_RouterBridge.h>
+#include <Arduino_LED_Matrix.h>
 
 Arduino_LED_Matrix matrix;
 
-static const int PIN_RX = 0;      // D0 <- Minitel
-static const int PIN_TX = 1;      // D1 -> Minitel
-static const uint32_t BIT_US = 833;   // 1 / 1200 s
+// ---- USART1 du STM32U585 (TrustZone desactivee : alias non securise) ----
+#define MT_USART1        0x40013800u
+#define MT_REG(off)      (*(volatile uint32_t *)(MT_USART1 + (off)))
+#define MT_CR1           MT_REG(0x00)
+#define MT_BRR           MT_REG(0x0C)
+#define MT_ISR           MT_REG(0x1C)
+#define MT_PRESC         MT_REG(0x2C)
+#define MT_CR1_UE        (1u << 0)
+#define MT_ISR_TC        (1u << 6)
+#define MT_PRESC_DIV8    0x4u          // 0100 : horloge noyau / 8
+
+static uint32_t brr9600 = 0;
+
+static void regler1200bauds() {
+  brr9600 = MT_BRR & 0xFFFFu;                      // horloge noyau = BRR x 9600 (surechantillonnage x16)
+  uint32_t brr1200 = (brr9600 * 9600u / 8u + 600u) / 1200u;
+  while (!(MT_ISR & MT_ISR_TC)) {}                 // rien en cours d'emission
+  MT_CR1 &= ~MT_CR1_UE;                            // PRESC et BRR ne s'ecrivent qu'USART arretee
+  MT_PRESC = MT_PRESC_DIV8;
+  MT_BRR = brr1200;
+  MT_CR1 |= MT_CR1_UE;
+}
 
 // ---- Matrice 13 x 8 -------------------------------------------------
 static const char* ICONS[][8] = {
-  { ".............", ".............", ".............", ".............",
+  { // 0 : demarrage  "..."
+    ".............", ".............", ".............", ".............",
     "..#...#...#..", ".............", ".............", "............." },
-  { ".............", "...#.....#...", "...##...##...", "...#.#.#.#...",
+  { // 1 : pret  "M"
+    ".............", "...#.....#...", "...##...##...", "...#.#.#.#...",
     "...#..#..#...", "...#.....#...", "...#.....#...", "............." },
-  { ".............", "...#....#....", "....#....#...", ".....#....#..",
+  { // 2 : connexion en cours  ">>"
+    ".............", "...#....#....", "....#....#...", ".....#....#..",
     "....#....#...", "...#....#....", ".............", "............." },
-  { ".............", "..........#..", ".........#...", "........#....",
+  { // 3 : en ligne  coche
+    ".............", "..........#..", ".........#...", "........#....",
     "..#....#.....", "...#..#......", "....##.......", "............." },
-  { ".............", "...#.....#...", "....#...#....", ".....#.#.....",
+  { // 4 : erreur  "X"
+    ".............", "...#.....#...", "....#...#....", ".....#.#.....",
     "......#......", ".....#.#.....", "....#...#....", "...#.....#..." },
 };
 
@@ -45,11 +70,17 @@ void drawIcon(int idx, bool dot) {
   for (int y = 0; y < 8; y++)
     for (int x = 0; x < 13; x++)
       frame[y * 13 + x] = ICONS[idx][y][x] == '#' ? 7 : 0;
-  if (dot) frame[0] = 7;
+  if (dot) frame[0] = 7;               // point d'activite en haut a gauche
   matrix.draw(frame);
 }
 
-// ---- UART logicielle : emission --------------------------------------
+// ---- File d'emission (remplie par le Bridge, videe au rythme de 1200 bauds) ----
+static const uint16_t TX_N = 4096;
+static uint8_t  txBuf[TX_N];
+static uint16_t txHead = 0, txTail = 0;
+
+static uint16_t txLibre() { return (uint16_t)(TX_N - 1 - (uint16_t)(txHead - txTail) % TX_N); }
+
 uint8_t withEvenParity(uint8_t c) {
   c &= 0x7F;
   uint8_t p = 0;
@@ -57,65 +88,6 @@ uint8_t withEvenParity(uint8_t c) {
   return p ? (c | 0x80) : c;
 }
 
-void txByte(uint8_t b) {                 // b = 8 bits deja prets (7 donnees + parite)
-  uint16_t f = ((uint16_t)b << 1) | (1u << 9);   // start(0) + 8 bits + stop(1)
-  uint32_t t0 = micros();
-  digitalWrite(PIN_TX, LOW);
-  for (int i = 1; i < 10; i++) {
-    while ((uint32_t)(micros() - t0) < BIT_US * i) {}
-    digitalWrite(PIN_TX, (f >> i) & 1);
-  }
-  while ((uint32_t)(micros() - t0) < BIT_US * 10 + 100) {}   // stop + petite marge
-}
-
-// ---- UART logicielle : reception --------------------------------------
-static const uint16_t NE = 512;
-volatile uint32_t edgeT[NE];
-volatile uint8_t  edgeL[NE];
-volatile uint16_t edgeHead = 0;
-uint16_t edgeTail = 0;
-
-void onEdge() {
-  uint16_t h = edgeHead;
-  edgeT[h % NE] = micros();
-  edgeL[h % NE] = digitalRead(PIN_RX);
-  edgeHead = h + 1;
-}
-
-bool inFrame = false;
-uint32_t frameT0 = 0;
-String rxHex;
-
-void emitByte(uint8_t v) {
-  const char* d = "0123456789abcdef";
-  rxHex += d[v >> 4];
-  rxHex += d[v & 0x0F];
-}
-
-void decodeRx() {
-  while (true) {
-    if (!inFrame) {
-      if (edgeTail == edgeHead) return;
-      uint16_t k = edgeTail % NE;
-      if (edgeL[k] == 0) { inFrame = true; frameT0 = edgeT[k]; }
-      edgeTail++;
-      continue;
-    }
-    if ((uint32_t)(micros() - frameT0) < BIT_US * 10) return;   // trame pas finie
-    uint8_t v = 0; uint8_t level = 0; uint16_t k = edgeTail;
-    for (int i = 1; i <= 8; i++) {
-      uint32_t ts = frameT0 + BIT_US * i + BIT_US / 2;
-      while (k != edgeHead && (int32_t)(edgeT[k % NE] - ts) <= 0) { level = edgeL[k % NE]; k++; }
-      if (level) v |= (1 << (i - 1));
-    }
-    uint32_t tEnd = frameT0 + BIT_US * 9 + BIT_US / 2;
-    while (edgeTail != edgeHead && (int32_t)(edgeT[edgeTail % NE] - tEnd) <= 0) edgeTail++;
-    inFrame = false;
-    emitByte(v & 0x7F);                  // on retire la parite
-  }
-}
-
-// ---- Fonctions appelees par Linux (executees dans loop via provide_safe) ----
 int hexVal(char h) {
   if (h >= '0' && h <= '9') return h - '0';
   if (h >= 'a' && h <= 'f') return h - 'a' + 10;
@@ -123,11 +95,24 @@ int hexVal(char h) {
   return 0;
 }
 
-bool minitel_write(String hex) {
-  for (unsigned int i = 0; i + 1 < hex.length(); i += 2)
-    txByte(withEvenParity((hexVal(hex[i]) << 4) | hexVal(hex[i + 1])));
+// ---- Fonctions appelees par Linux (executees dans loop via provide_safe) ----
+// Met les octets en file sans bloquer ; renvoie combien ont ete acceptes.
+int minitel_write(String hex) {
+  int n = 0;
+  for (unsigned int i = 0; i + 1 < hex.length(); i += 2) {
+    if (txLibre() == 0) break;
+    txBuf[txHead % TX_N] = withEvenParity((hexVal(hex[i]) << 4) | hexVal(hex[i + 1]));
+    txHead++;
+    n++;
+  }
   lastActivity = millis();
-  return true;
+  return n;
+}
+
+int minitel_libre() { return (int)txLibre(); }
+
+String minitel_diag() {
+  return String("BRR9600=") + brr9600 + " BRR=" + MT_BRR + " PRESC=" + MT_PRESC + " horloge=" + (brr9600 * 9600u);
 }
 
 bool set_state(int idx) {
@@ -143,28 +128,54 @@ void setup() {
   matrix.clear();
   drawIcon(0, false);
 
-  pinMode(PIN_TX, OUTPUT);
-  digitalWrite(PIN_TX, HIGH);            // ligne au repos = 1
-  pinMode(PIN_RX, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_RX), onEdge, CHANGE);
+  Serial1.begin(9600);                 // 8N1, vitesse que le pilote sait regler...
+  delay(5);
+  regler1200bauds();                   // ...puis 1200 bauds via PRESC
 
   Bridge.begin();
   Bridge.provide_safe("minitel_write", minitel_write);
+  Bridge.provide_safe("minitel_libre", minitel_libre);
+  Bridge.provide_safe("minitel_diag", minitel_diag);
   Bridge.provide_safe("set_state", set_state);
 }
 
-uint32_t lastFlush = 0;
+String rxHex;
+uint32_t rxDernier = 0;
 
 void loop() {
-  decodeRx();
-  // Envoie les octets recus par paquets (fin de rafale ou 64 octets)
-  if (rxHex.length() >= 128 || (rxHex.length() > 0 && !inFrame && millis() - lastFlush > 30)) {
+  static const char* HX = "0123456789abcdef";
+  uint32_t m = millis();
+
+  // Minitel -> Linux, par paquets (fin de rafale ou 64 octets)
+  while (Serial1.available() && rxHex.length() < 128) {
+    uint8_t b = Serial1.read() & 0x7F;  // on retire le bit de parite
+    rxHex += HX[b >> 4];
+    rxHex += HX[b & 0x0F];
+    rxDernier = m;
+  }
+  if (rxHex.length() >= 128 || (rxHex.length() > 0 && (int32_t)(m - rxDernier) > 20)) {
     Bridge.notify("from_minitel", rxHex);
     rxHex = "";
-    lastActivity = millis();
+    lastActivity = m;
   }
-  if (rxHex.length() == 0) lastFlush = millis();
 
-  bool dot = (currentIcon == 3) && (millis() - lastActivity < 150);
+  // Linux -> Minitel : au rythme de 1200 bauds (1 octet / 8,33 ms, rafales de 8 max),
+  // pour que le tampon de Serial1 ne se remplisse jamais et que write() ne bloque jamais.
+  static uint32_t credit_t = 0;
+  static uint8_t  credit = 8;
+  uint32_t u = micros();
+  if ((uint32_t)(u - credit_t) >= 8334u) {
+    uint32_t n = (uint32_t)(u - credit_t) / 8334u;
+    credit = (uint8_t)min<uint32_t>(8u, credit + n);
+    credit_t += n * 8334u;
+  }
+  while (credit > 0 && txHead != txTail) {
+    Serial1.write(txBuf[txTail % TX_N]);
+    txTail++;
+    credit--;
+  }
+
+  // Point d'activite qui clignote en ligne
+  bool dot = (currentIcon == 3) && (m - lastActivity < 150);
   if (dot != activityDot) { activityDot = dot; drawIcon(currentIcon, dot); }
 }
